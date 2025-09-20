@@ -50,6 +50,7 @@ p_active_md <- 1.3 # this can be set to your own limit, as long as the portfolio
 weight_bounds <- c(0.0, 0.2)
 weight_matrix <- tibble()
 
+
 # Signal & Weight Generation ----
 
 for(i in 1:nrow(df_signals)){
@@ -82,23 +83,48 @@ for(i in 1:nrow(df_signals)){
   
   p_albi_md <- df_train_albi$modified_duration %>% tail(1)
   
-  # feature engineering
-  df_train_macro <- 
-    df_train_macro %>% 
-    mutate(steepness = us_10y - us_2y)
+  # --- Feature engineering for macro ---
+  df_train_macro <- df_train_macro %>% 
+    mutate(
+      steepness      = us_10y - us_2y,                   # yield curve slope
+      steepness_20y  = us_20y - us_10y,                 # longer-term slope
+      top40_mom      = top40_return - lag(top40_return, 1),  # equity momentum
+      comdty_mom     = comdty_fut - lag(comdty_fut, 1)      # commodity momentum
+    )
   
-  df_train_bonds <- 
-    df_train_bonds %>% 
+  # --- Feature engineering for bonds ---
+  df_train_bonds <- df_train_bonds %>% 
     group_by(bond_code) %>% 
-    mutate(md_per_conv = rollmeanr(return, n_days,na.pad = TRUE)*convexity/modified_duration) %>% 
-    left_join(df_train_macro, by = "datestamp") %>% 
-    mutate(signal = md_per_conv*100 - top40_return/10 + comdty_fut/100)
+    mutate(
+      ret_per_md    = return / modified_duration,          # risk-adjusted return
+      roll5_ret     = rollmeanr(return, 5, fill = NA),     # short-term return
+      roll20_ret    = rollmeanr(return, 20, fill = NA),    # medium-term return
+      roll_vol      = rollapply(return, 20, sd, fill = NA, align = "right"), # volatility
+      yield_chg     = yield - lag(yield),                  # yield change momentum
+      ret_per_conv  = return * convexity / modified_duration # convexity-adjusted return
+    ) %>%
+    ungroup() %>%
+    left_join(df_train_macro, by = "datestamp") %>%
+    mutate(
+      # --- Updated signal ---
+      signal = 0.35*roll5_ret +        # short-term returns matter most
+        0.25*ret_per_md +       # risk-adjusted return
+        0.15*ret_per_conv +     # convexity-adjusted return
+        0.10*steepness +        # macro slope
+        0.05*steepness_20y +   # longer-term slope
+        0.05*top40_mom -        # equity momentum
+        0.10*roll_vol           # penalize high volatility
+    )
   
-  df_train_bonds_current <- 
-    df_train_bonds %>% 
+  
+  
+  # Prepare current date for optimization
+  df_train_bonds_current <- df_train_bonds %>% 
     filter(datestamp == max(datestamp)) %>% 
     mutate(active_md = modified_duration - p_albi_md)
   
+  
+  ######
   # --- Optimisation setup ---
   n <- nrow(df_train_bonds_current)
   signals <- df_train_bonds_current$signal
@@ -106,6 +132,7 @@ for(i in 1:nrow(df_signals)){
   
   # CVXR variable
   w <- Variable(n)
+  
   
   # Parameters
   turnover_lambda <- 0.5             # penalty weight for excess turnover
@@ -155,14 +182,14 @@ plot_payoff <- function(weight_matrix, df_bonds, df_albi) {
               port_md = sum(port_md, na.rm = TRUE), .groups = "drop") %>%
     left_join(df_albi[, c("datestamp", "return")], by = "datestamp") %>%
     rename(albi_return = return)
-
+  
   df_turnover <- weight_matrix %>%
     group_by(bond_code) %>%
     arrange(datestamp) %>%
     mutate(turnover = abs(weight - lag(weight))/2) %>%
     group_by(datestamp) %>%
     summarise(turnover = sum(turnover, na.rm = TRUE), .groups = "drop")
-
+  
   port_data <- port_data %>%
     left_join(df_turnover, by = "datestamp") %>%
     arrange(datestamp) %>%
@@ -172,25 +199,25 @@ plot_payoff <- function(weight_matrix, df_bonds, df_albi) {
       portfolio_tri = cumprod(1 + net_return / 100),
       albi_tri = cumprod(1 + albi_return / 100)
     )
-
+  
   tri_data <- port_data %>%
     select(datestamp, portfolio_tri, albi_tri) %>%
     pivot_longer(-datestamp, names_to = "type", values_to = "TRI")
-
+  
   print(ggplot(tri_data, aes(x = datestamp, y = TRI, color = type)) +
           geom_line(size = 1) +
           labs(title = "Portfolio vs ALBI TRI", x = "Date", y = "TRI") +
           theme_minimal())
-
+  
   print(ggplot(port_data, aes(x = datestamp, y = turnover)) +
           geom_line(color = "darkred", size = 1) +
           labs(title = "Daily Turnover", x = "Date", y = "Turnover") +
           theme_minimal())
-
+  
   print(ggplot(weight_matrix, aes(x = datestamp, y = weight, fill = bond_code))+ 
-    geom_area() +
-    labs(title = "Weights Through Time", x = "Date", y = "Weight") +
-    theme_minimal())
+          geom_area() +
+          labs(title = "Weights Through Time", x = "Date", y = "Weight") +
+          theme_minimal())
   
   cat(sprintf("---> payoff for these buys between %s and %s is %.2f%%\n",
               min(port_data$datestamp), max(port_data$datestamp),
@@ -207,12 +234,12 @@ plot_md <- function(weight_matrix, df_bonds, df_albi) {
     summarise(port_md = sum(port_md, na.rm = TRUE), .groups = "drop") %>%
     left_join(df_albi[, c("datestamp", "modified_duration")], by = "datestamp") %>%
     mutate(active_md = port_md - modified_duration)
-
+  
   print(ggplot(port_data, aes(x = datestamp, y = active_md)) +
           geom_line(color = "steelblue", size = 1) +
           labs(title = "Active Modified Duration", x = "Date", y = "Active MD") +
           theme_minimal())
-
+  
   breaches <- port_data %>% filter(abs(active_md) > 1.5)
   if (nrow(breaches) > 0) {
     stop(paste("This portfolio violates the duration constraint on:\n",
